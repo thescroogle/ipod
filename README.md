@@ -23,4 +23,5 @@ Rebuild the seed: python3 build/fetch_data.py && python3 build/assemble.py
 - Reset asks for confirmation. About shows the song and artist counts.
 - Backlight options are Off, 1, 2, 3 or 5 seconds, or Always On. The default follows the color scheme.
 - Hidden Brick game: hold center for 5 seconds on Settings > About.
-- Build: `python3 build/assemble2.py` with `OUT=.` writes `index.html` and `songs.json`.
+- Preloaded track: OBSESSION by Aulani Design Lab is cued on load (`preload` in songs.json). It is visible in Now Playing and the mini player, and starts on the first play press. It never autoplays.
+- Build: `OUT=. AULANI_OUT= python3 build/assemble2.py` writes `index.html` and `songs.json`.
