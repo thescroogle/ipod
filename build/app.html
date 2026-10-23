@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0c">
+<meta name="referrer" content="no-referrer">
+<title>__TITLE__</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%224%22 fill=%22%23eee%22/%3E%3Ccircle cx=%228%22 cy=%2210%22 r=%224%22 fill=%22none%22 stroke=%22%23999%22/%3E%3Crect x=%224%22 y=%222%22 width=%228%22 height=%224%22 fill=%22%23b7cae5%22/%3E%3C/svg%3E">
+<style>
+__CSS__
+</style>
+</head>
+<body>
+<div id="brand"></div>
+<div id="stage">
+ <div id="scaler"><div id="tilt">
+  <div class="ipod" id="ipod"><div class="face">
+   <div class="bezel"><div class="lcd" id="lcd">
+     <div class="bar"><span class="pl" id="playind"></span><span class="ttl" id="title">Pod</span><span class="batt"><i></i><i></i><i></i><i></i></span></div>
+     <div class="view" id="view"></div>
+   </div></div>
+   <div class="wheel" id="wheel" role="application" aria-label="Click wheel. Drag in a circle to scroll." tabindex="0">
+     <div class="div" style="transform:rotate(45deg)"></div><div class="div" style="transform:rotate(-45deg)"></div>
+     <div class="seg s-menu" id="seg-menu">menu</div>
+     <div class="seg s-prev ico" id="seg-prev"><span class="bar1"></span><span class="tri l"></span><span class="tri l"></span></div>
+     <div class="seg s-next ico" id="seg-next"><span class="tri r"></span><span class="tri r"></span><span class="bar1"></span></div>
+     <div class="seg s-play ico" id="seg-play"><span class="tri r"></span><span style="width:3px"></span><span class="bar1"></span><span style="width:2px"></span><span class="bar1"></span></div>
+     <div class="inner" id="inner"></div>
+     <div class="center" id="center"></div>
+   </div>
+  </div></div>
+ </div></div>
+</div>
+<div id="mini">
+  <div class="art" id="mart">&#9835;</div>
+  <div class="meta"><div class="t" id="mt">Not Playing</div><div class="a" id="ma">Press the center button to start</div></div>
+  <button id="mplay" aria-label="Play"><svg width="22" height="22" viewBox="0 0 24 24" id="mplayico"><path d="M7 4.5v15l12.5-7.5z"/></svg></button>
+  <button id="mnext" aria-label="Next track"><svg width="28" height="22" viewBox="0 0 28 24"><path d="M2 5v14l11-7zM14 5v14l11-7z"/></svg></button>
+  <div class="prog2"><i id="mprog"></i></div>
+</div>
+<div id="toast"></div>
+<script>
+"use strict";
+/* ============================================================
+   Pod: a 1st-gen style click-wheel music player.
+   Library is loaded from songs.json (same folder). Each track may carry
+   an optional full-length "src"; otherwise its 30-second "preview" plays.
+   ============================================================ */
+const DATA_URL = "songs.json";
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const fmt = s => { s = Math.max(0, Math.floor(s || 0)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+/* ---------------- tuning (behaviour measured against the reference player) ---------------- */
+const T = {
+  listStepDeg: 15,                     /* one row per 15 degrees of rotation */
+  volUnitDeg: 1.25 * 360 / 100,        /* 1.25 turns sweep 0..100 volume */
+  volClickDeg: 1.25 * 360 / 22,        /* 22 detent clicks across the volume range */
+  seekStepDeg: 15, seekStepSec: 1,
+  flipDeg: 8,                          /* reversal hysteresis */
+  minChord: 0.1,                       /* ignore moves shorter than 10% of radius */
+  accel: { minSpeed: 180, tierMs: 500, maxSpeed: 400, alpha: 0.15, gapMs: 250, list: [1, 2, 3, 5, 8, 13, 21, 34], seek: [1, 2, 3, 5] },
+  holdMs: 1000, holdRepeatMs: 250, holdSeek: [5, 5, 5, 10, 10, 10, 20],
+  aboutHoldMs: 5000, idleToNowPlayingMs: 10000, volOverlayMs: 5000, seekModeMs: 5000,
+  fadeSec: 2, prevRestartSec: 3, clickGain: 0.3, clickMinGap: 0.05, clickMaxAhead: 0.15,
+};
+
+/* ---------------- settings ---------------- */
+const SKEY = "pod:settings:v2";
+const darkPref = window.matchMedia && matchMedia("(prefers-color-scheme: dark)");
+const DEFAULTS = () => ({ shuffle: "off", repeat: "off", clicker: "on", backlight: darkPref && darkPref.matches ? "always" : "off", volume: 50, tilt: "off" });
+let S = DEFAULTS();
+try { Object.assign(S, JSON.parse(localStorage.getItem(SKEY) || "{}")); } catch (e) {}
+const save = () => { try { localStorage.setItem(SKEY, JSON.stringify(S)); } catch (e) {} };
+const BACKLIGHT = [["off", "Off"], ["1", "1 second"], ["2", "2 seconds"], ["3", "3 seconds"], ["5", "5 seconds"], ["always", "Always On"]];
+
+/* ---------------- library ---------------- */
+const LIB = { songs: [], byId: new Map(), artists: [], playlists: [], search: [], ready: false };
+function sortName(s) { return s.replace(/^(the|a|an)\s+/i, "").toLowerCase(); }
+function ingest(d) {
+  LIB.songs = (d.songs || []).filter(s => s.src || s.preview);
+  LIB.byId = new Map(LIB.songs.map(s => [String(s.id), s]));
+  const pick = ids => (ids || []).map(id => LIB.byId.get(String(id))).filter(Boolean);
+  LIB.playlists = (d.playlists || []).map(p => ({ id: p.id, name: p.name, songs: pick(p.songIds) })).filter(p => p.songs.length);
+  let artists = d.artists && d.artists.length ? d.artists.map(a => ({ id: a.id, name: a.name, songs: pick(a.songIds), pin: !!a.pinned }))
+    : [...LIB.songs.reduce((m, s) => (m.get(s.artist) || m.set(s.artist, []).get(s.artist)).push(s) && m, new Map())].map(([name, songs]) => ({ id: name, name, songs }));
+  artists = artists.filter(a => a.songs.length);
+  artists.sort((a, b) => (b.pin - a.pin) || sortName(a.name).localeCompare(sortName(b.name)));
+  LIB.artists = artists;
+  if (d.songOrder !== "as-is") LIB.songs.sort((a, b) => sortName(a.name).localeCompare(sortName(b.name)));
+  const th = d.theme || {};
+  if (th.background) document.documentElement.style.setProperty("--pagebg", th.background);
+  if (th.accent) document.documentElement.style.setProperty("--accent", th.accent); else document.body.classList.add("noglow");
+  if (th.label) $("brand").textContent = th.label;
+  if (th.title) document.title = th.title;
+  LIB.ready = true;
+}
+function fromItunes(r) {
+  return { id: "it" + r.trackId, name: r.trackName, artist: r.artistName, album: r.collectionName || "", art: r.artworkUrl100 || "",
+           preview: r.previewUrl, dur: r.trackTimeMillis || 0, explicit: r.trackExplicitness === "explicit" };
+}
+let jsonpN = 0;
+function itunes(path, params) {
+  const url = "https://itunes.apple.com/" + path + "?" + new URLSearchParams(Object.assign({ country: "us" }, params));
+  return fetch(url, { credentials: "omit", referrerPolicy: "no-referrer" }).then(r => { if (!r.ok) throw 0; return r.json(); }).catch(() => new Promise((res, rej) => {
+    const cb = "__itcb" + (++jsonpN), sc = document.createElement("script");
+    const t = setTimeout(() => { done(); rej(new Error("timeout")); }, 12000);
+    function done() { clearTimeout(t); delete window[cb]; sc.remove(); }
+    window[cb] = d => { done(); res(d); }; sc.onerror = () => { done(); rej(new Error("jsonp")); };
+    sc.src = url + "&callback=" + cb; document.head.appendChild(sc);
+  }));
+}
+
+/* ---------------- audio engine: two channels, equal-power crossfade, WebAudio gain ---------------- */
+let actx = null, master = null, webAudio = false;
+const SILENT = "data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA";
+const fadeIn = new Float32Array(50).map((_, i) => Math.cos((1 - i / 49) * Math.PI / 2));
+const fadeOut = new Float32Array(50).map((_, i) => Math.cos(i / 49 * Math.PI / 2));
+function mkChannel() {
+  const a = new Audio(); a.preload = "auto"; a.crossOrigin = "anonymous"; a.setAttribute("playsinline", ""); a.playsInline = true;
+  return { a, g: null, node: null, unlocked: false, song: null };
+}
+const CH = [mkChannel(), mkChannel()];
+let curCh = 0;
+function ensureAudio() {
+  if (!actx) {
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      master = actx.createGain(); master.connect(actx.destination);
+      CH.forEach(c => { c.node = actx.createMediaElementSource(c.a); c.g = actx.createGain(); c.g.gain.value = 0; c.node.connect(c.g); c.g.connect(master); });
+      webAudio = true;
+    } catch (e) { webAudio = false; }
+    applyVolume();
+  }
+  if (actx && actx.state !== "running") actx.resume().catch(() => {});
+  /* iOS: each media element must be started once inside a user gesture */
+  CH.forEach(c => { if (!c.unlocked && !c.a.src) { c.a.src = SILENT; const p = c.a.play(); if (p) p.then(() => { c.a.pause(); }).catch(() => {}); } c.unlocked = true; });
+}
+function applyVolume() {
+  const v = S.volume / 100;
+  if (webAudio) { master.gain.value = v * v; CH.forEach(c => c.a.volume = 1); }
+  else CH.forEach(c => c.a.volume = v);
+}
+function setGain(c, curve, dur) {
+  if (!webAudio) return;
+  const t = actx.currentTime; c.g.gain.cancelScheduledValues(t);
+  if (curve) { try { c.g.gain.setValueCurveAtTime(curve, t, dur); } catch (e) { c.g.gain.setValueAtTime(curve[curve.length - 1], t); } }
+}
+function cutIn(c) { if (webAudio) { c.g.gain.cancelScheduledValues(actx.currentTime); c.g.gain.setValueAtTime(1, actx.currentTime); } }
+const A = () => CH[curCh];
+
+/* rate-limited click tick (synthesised; scheduled so fast spins never smear) */
+let clickAt = 0, clickBuf = null;
+function click(n) {
+  if (S.clicker !== "on" || !actx || actx.state !== "running") return;
+  if (!clickBuf) {
+    const len = Math.floor(actx.sampleRate * 0.008); clickBuf = actx.createBuffer(1, len, actx.sampleRate);
+    const d = clickBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 5) * (i < 3 ? i / 3 : 1);
+  }
+  for (let k = 0; k < (n || 1); k++) {
+    const now = actx.currentTime;
+    if (clickAt - now >= T.clickMaxAhead) return;
+    const at = Math.max(now, clickAt);
+    const s = actx.createBufferSource(), hp = actx.createBiquadFilter(), g = actx.createGain();
+    hp.type = "highpass"; hp.frequency.value = 2200; g.gain.value = T.clickGain * 1.6;
+    s.buffer = clickBuf; s.connect(hp); hp.connect(g); g.connect(actx.destination); s.start(at);
+    clickAt = at + T.clickMinGap;
+  }
+}
+
+/* ---------------- queue / transport ---------------- */
+const P = { list: [], order: [], pos: -1, playing: false, source: null, fading: false };
+const curSong = () => P.pos >= 0 && P.order.length ? P.list[P.order[P.pos]] : null;
+function shuffleArr(a) { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+function setQueue(list, start, source) {
+  P.list = list.slice(); P.source = source || null;
+  P.order = P.list.map((_, i) => i);
+  if (S.shuffle === "songs") { shuffleArr(P.order); const k = P.order.indexOf(start); if (k > 0) [P.order[0], P.order[k]] = [P.order[k], P.order[0]]; P.pos = 0; }
+  else P.pos = start;
+  startCurrent(true, false);
+}
+function srcOf(s) { return s.src || s.preview; }
+function startCurrent(autoplay, crossfade) {
+  const s = curSong(); if (!s) return;
+  const old = A();
+  if (crossfade && webAudio && !old.a.paused) {
+    curCh ^= 1; const c = A();
+    c.song = s; c.a.src = srcOf(s); c.a.currentTime = 0; setGain(c, fadeIn, T.fadeSec);
+    setGain(old, fadeOut, T.fadeSec); const oa = old.a; setTimeout(() => { if (A() !== old) oa.pause(); }, T.fadeSec * 1000 + 50);
+    c.a.play().catch(() => {});
+  } else {
+    CH.forEach(c => { if (c !== old) { c.a.pause(); setGain(c, null); if (webAudio) c.g.gain.value = 0; } });
+    old.song = s; old.a.src = srcOf(s); try { old.a.currentTime = 0; } catch (e) {}
+    cutIn(old);
+    if (autoplay) old.a.play().catch(() => {});
+  }
+  P.fading = false; P.ever = true; updateMini(); bumpIdle();
+  if (cur().key === "nowplaying") renderNP();
+}
+function play() { ensureAudio(); const c = A(); if (!c.song) return; cutIn(c); c.a.play().catch(() => {}); }
+function pause() { CH.forEach(c => c.a.pause()); }
+function togglePlay() {
+  if (!curSong()) { if (LIB.songs.length) { setQueue(LIB.songs, 0, "songs"); } return; }
+  A().a.paused ? play() : pause();
+}
+function advance(auto, crossfade) {
+  if (!curSong()) return false;
+  if (auto && S.repeat === "one") { if (crossfade) startCurrent(true, true); else { A().a.currentTime = 0; play(); } return true; }
+  if (P.pos < P.order.length - 1) P.pos++;
+  else if (S.repeat === "all" || !auto) { if (S.shuffle === "songs" && auto) shuffleArr(P.order); P.pos = 0; }
+  else return false;
+  startCurrent(true, crossfade); return true;
+}
+function next() { advance(false, false); }
+function prev() {
+  if (!curSong()) return;
+  const a = A().a;
+  if (a.currentTime > T.prevRestartSec || P.pos === 0) { a.currentTime = 0; return; }
+  P.pos--; startCurrent(true, false);
+}
+function wire(c) {
+  c.a.addEventListener("play", () => { if (c === A()) { P.playing = true; refreshChrome(); } });
+  c.a.addEventListener("pause", () => { if (c === A()) { P.playing = false; refreshChrome(); } });
+  c.a.addEventListener("timeupdate", () => {
+    if (c !== A() || !c.song) return;
+    const d = c.a.duration, t = c.a.currentTime;
+    if (!P.fading && webAudio && isFinite(d) && d > T.fadeSec + 1 && t >= d - T.fadeSec) {
+      P.fading = true;
+      if (!advance(true, true)) setGain(c, fadeOut, T.fadeSec);
+    }
+    if (cur().key === "nowplaying") updateNP(); updateMiniProgress();
+  });
+  c.a.addEventListener("ended", () => { if (c !== A()) return; if (!P.fading) { if (!advance(true, false)) { P.playing = false; pause(); c.a.currentTime = 0; refreshChrome(); } } else if (!curSong() || A() === c) { P.playing = false; refreshChrome(); } });
+  c.a.addEventListener("loadedmetadata", () => { if (c === A() && cur().key === "nowplaying") updateNP(); });
+  c.a.addEventListener("error", () => { if (c === A() && c.song && c.a.src !== SILENT && c.a.getAttribute("src")) { if (c.song.src && c.a.src.indexOf(c.song.preview) < 0 && c.song.preview) { c.a.src = c.song.preview; c.a.play().catch(() => {}); } else { toast("Track unavailable, skipping"); setTimeout(() => advance(true, false), 500); } } });
+}
+CH.forEach(wire);
+if ("mediaSession" in navigator) {
+  const ms = navigator.mediaSession;
+  ms.setActionHandler("play", play); ms.setActionHandler("pause", pause);
+  ms.setActionHandler("nexttrack", next); ms.setActionHandler("previoustrack", prev);
+}
+
+/* ---------------- screens ---------------- */
+const nav = (label, key, ctx, extra) => Object.assign({ label, go: key, ctx }, extra || {});
+const toggleRow = (label, key, values) => ({ label, value: () => (values.find(v => v[0] === S[key]) || values[0])[1],
+  action: () => { const i = values.findIndex(v => v[0] === S[key]); S[key] = values[(i + 1) % values.length][0]; save(); applySettings(); render(); return true; } });
+const playRows = (list, src) => list.length ? list.map((s, i) => ({ label: s.name, explicit: s.explicit, action: () => { setQueue(list, i, src); push("nowplaying"); } })) : [{ label: "No Music", info: true, center: true }];
+const SCREENS = {
+  main: { title: () => "Pod", items: () => [nav("Playlists", "playlists"), nav("Artists", "artists"), nav("Songs", "songs"), nav("Settings", "settings"), ...(P.ever && curSong() ? [nav("Now Playing", "nowplaying")] : [])] },
+  playlists: { title: () => "Playlists", items: () => {
+    const r = LIB.playlists.map(p => nav(p.name, "playlist", p));
+    if (LIB.search.length) r.push(nav("Search Results", "results"));
+    r.push(nav("Search iTunes", "search"));
+    return r; } },
+  playlist: { title: c => c.name, items: c => playRows(c.songs, "pl:" + c.id) },
+  artists: { title: () => "Artists", items: () => LIB.artists.length ? [nav("All", "songs", null, { title: "All Songs" }), ...LIB.artists.map(a => nav(a.name, "artist", a))] : [{ label: "No Music", info: true, center: true }] },
+  artist: { title: c => c.name, items: c => playRows(c.songs, "ar:" + c.id) },
+  songs: { title: (c, st) => st && st.title || "Songs", items: () => playRows(LIB.songs, "songs") },
+  results: { title: () => "Search Results", items: () => playRows(LIB.search, "search") },
+  settings: { title: () => "Settings", items: () => [
+    nav("About", "about"),
+    toggleRow("Shuffle", "shuffle", [["off", "Off"], ["songs", "Songs"]]),
+    toggleRow("Repeat", "repeat", [["off", "Off"], ["one", "One"], ["all", "All"]]),
+    nav("Backlight Timer", "backlight"),
+    toggleRow("Clicker", "clicker", [["on", "On"], ["off", "Off"]]),
+    toggleRow("3D Tilt", "tilt", [["off", "Off"], ["on", "On"]]),
+    nav("Reset All Settings", "reset")] },
+  backlight: { title: () => "Backlight Timer", items: () => BACKLIGHT.map(([v, l]) => ({ label: l, value: () => S.backlight === v ? "\u2713" : "", action: () => { S.backlight = v; save(); wake(); render(); return true; } })) },
+  reset: { title: () => "Reset All Settings", forget: true, items: () => [{ label: "Cancel", action: () => { back(); return true; } },
+    { label: "Reset", action: () => { S = DEFAULTS(); save(); applySettings(); back(); return true; } }] },
+  about: { title: () => "About", hold: "brick", items: () => [
+    { label: "Pod", info: true, center: true },
+    { label: "Songs", info: true, value: () => LIB.songs.length.toLocaleString() },
+    { label: "Artists", info: true, value: () => LIB.artists.length.toLocaleString() },
+    { label: "Capacity", info: true, value: () => "9.2 GB" },
+    { label: "Available", info: true, value: () => "4.5 GB" },
+    { label: "Version", info: true, value: () => "1.1.0" }] },
+};
+
+/* ---------------- navigation (each list remembers its selection) ---------------- */
+const memory = new Map();
+const memKey = (key, ctx) => key + ":" + (ctx && ctx.id != null ? ctx.id : "");
+let stack = [{ key: "boot" }];
+const cur = () => stack[stack.length - 1];
+function push(key, ctx, title) {
+  if (key === "nowplaying" && cur().key === "nowplaying") { render(); return; }
+  if (key === "nowplaying") { const i = stack.findIndex(s => s.key === "nowplaying"); if (i >= 0) stack.splice(i); }
+  const m = SCREENS[key], mk = memKey(key, ctx);
+  let sel = m && !m.forget && memory.has(mk) ? memory.get(mk) : 0;
+  if (m) { const items = m.items(ctx); if (items[sel] && items[sel].info && !items[sel].value) sel = Math.min(items.length - 1, sel + 1); }
+  if (key === "about") sel = 0;
+  stack.push({ key, ctx, sel, top: Math.max(0, sel - 2), title }); npMode = "normal"; render();
+}
+function back() {
+  if (cur().key === "boot" || stack.length <= 1) return false;
+  const st = stack.pop(); memory.set(memKey(st.key, st.ctx), st.sel); exitBrick(); npMode = "normal"; render(); return true;
+}
+function itemsOf(st) { const m = SCREENS[st.key]; return m ? m.items(st.ctx) : []; }
+const VISIBLE = 6;
+
+/* ---------------- rendering ---------------- */
+const view = $("view");
+function setTitle(t) { $("title").textContent = t; }
+function render() {
+  const st = cur();
+  if (st.key === "boot") return renderBoot();
+  if (st.key === "nowplaying") return renderNP();
+  if (st.key === "search") return renderSearch();
+  if (st.key === "brick") return renderBrick();
+  const m = SCREENS[st.key], items = itemsOf(st);
+  setTitle(m.title(st.ctx, st));
+  st.sel = clamp(st.sel, 0, Math.max(0, items.length - 1));
+  if (st.sel < st.top) st.top = st.sel;
+  if (st.sel >= st.top + VISIBLE) st.top = st.sel - VISIBLE + 1;
+  st.top = clamp(st.top, 0, Math.max(0, items.length - VISIBLE));
+  const scroll = items.length > VISIBLE;
+  let h = '<div class="list' + (scroll ? " scroll" : "") + '">';
+  items.slice(st.top, st.top + VISIBLE).forEach((it, i) => {
+    const v = it.value ? it.value() : "", sel = st.top + i === st.sel && !(it.info && !it.value);
+    h += '<div class="row' + (sel ? " sel" : "") + (it.center ? " ctr" : "") + (it.info ? " info" : "") + '"><span class="lb"' + (it.center ? ' style="flex:none"' : "") + '>' + esc(it.label) + '</span>' +
+      (it.explicit ? '<span class="ex">E</span>' : "") + (v ? '<span class="vl">' + esc(v) + '</span>' : "") + (it.go ? '<span class="ch"></span>' : "") + '</div>';
+  });
+  h += '</div>';
+  if (scroll) { const hh = Math.max(6, 100 * VISIBLE / items.length), tp = (100 - hh) * st.top / (items.length - VISIBLE); h += '<div class="sb on"><i style="top:' + tp + '%;height:' + hh + '%"></i></div>'; }
+  view.innerHTML = h; refreshChrome();
+}
+function refreshChrome() {
+  const pi = $("playind"), on = !!curSong() && cur().key !== "boot";
+  pi.className = "pl" + (on ? " on" + (P.playing ? "" : " paused") : "");
+  if (on && !P.playing && cur().key !== "nowplaying") pi.className = "pl";
+  if (cur().key === "nowplaying") updateNP();
+  updateMini();
+}
+const GLYPH = '<svg width="46" height="46" viewBox="0 0 23 23" shape-rendering="crispEdges" fill="#22262b"><path d="M8 1h7v2h3v2h2v3h2v7h-2v3h-2v2h-3v2H8v-2H5v-2H3v-3H1V8h2V5h2V3h3zm0 4v1H6v2H5v7h1v2h2v1h7v-1h2v-2h1V8h-1V6h-2V5z"/><path d="M10 9h3v1h1v3h-1v1h-3v-1H9v-3h1z"/></svg>';
+function renderBoot() {
+  setTitle("Pod");
+  view.innerHTML = '<div class="boot">' + GLYPH + '<div class="hint">' + (LIB.ready ? "Press center to start" : LIB.failed ? "You are not connected to the internet" : "Loading") + '</div></div>';
+  refreshChrome();
+}
+function renderNP() {
+  setTitle("Now Playing");
+  const s = curSong();
+  if (!s) { view.innerHTML = '<div class="empty">Nothing Playing</div>'; refreshChrome(); return; }
+  view.innerHTML = '<div class="np" id="np"><div class="idx" id="npidx"></div>' +
+    [s.name, s.artist, s.album].map((t, i) => '<div class="ln"><span class="mq">' + esc(t) + (i === 0 && s.explicit ? ' <span class="ex">E</span>' : "") + '</span></div>').join("") +
+    '<div class="pwrap"><div class="prog" id="npprog"><i id="npbar"></i><b id="npdia"></b></div><div class="times"><span id="npel">0:00</span><span id="nprem">-0:00</span></div></div>' +
+    '<div class="vol"><span class="spk"></span><div class="prog"><i id="volbar"></i></div><span class="spk hi"><i></i></span></div></div>';
+  view.querySelectorAll(".mq").forEach(el => {
+    const over = el.scrollWidth - el.parentNode.clientWidth;
+    if (over > 2) { el.parentNode.style.textAlign = "left"; el.style.setProperty("--x", -(over + 4) + "px"); el.style.setProperty("--d", (3 + over / 18) + "s"); el.classList.add("run"); }
+  });
+  updateNP(); refreshChrome();
+}
+function updateNP() {
+  const s = curSong(), b = $("npbar"); if (!s || !b) return;
+  const a = A().a;
+  $("npidx").textContent = (P.pos + 1) + " of " + P.order.length;
+  const d = isFinite(a.duration) && a.duration > 0 ? a.duration : (s.src ? (s.dur || 0) / 1000 : 30) || 30;
+  const t = npMode === "seek" && seekPreview != null ? seekPreview : (a.currentTime || 0);
+  b.style.width = (100 * t / d) + "%"; $("npdia").style.left = (100 * t / d) + "%";
+  $("npel").textContent = fmt(t); $("nprem").textContent = "-" + fmt(d - t);
+  $("npprog").classList.toggle("seek", npMode === "seek");
+  $("np").classList.toggle("showvol", npMode === "volume");
+  const vb = $("volbar"); if (vb) vb.style.width = S.volume + "%";
+}
+/* search: wheel-driven character picker */
+const CHARS = ["DONE", ..."ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".split(""), "SPC", "DEL"];
+const SR = { q: "", i: 1, busy: false };
+function renderSearch() {
+  setTitle("Search");
+  let x = 0, selX = 0, cs = "";
+  CHARS.forEach((c, i) => { const w = c.length > 1, cw = w ? 52 : 26; if (i === SR.i) selX = x + cw / 2; x += cw;
+    cs += '<div class="c' + (w ? " w" : "") + (i === SR.i ? " sel" : "") + '">' + (c === "SPC" ? "\u2423" : c === "DEL" ? "\u232B" : c) + '</div>'; });
+  view.innerHTML = '<div class="srch"><div class="q">' + esc(SR.q) + '<span class="cur"></span></div><div class="strip" id="strip"><div class="cs" id="cs">' + cs + '</div></div><div class="shint">' +
+    (SR.busy ? "Searching\u2026" : "Scroll to pick, center to type.<br>Pick DONE to search iTunes.") + '</div></div>';
+  $("cs").style.transform = "translateX(" + ($("strip").clientWidth / 2 - selX) + "px)";
+  refreshChrome();
+}
+function searchSelect() {
+  const c = CHARS[SR.i];
+  if (c === "DEL") SR.q = SR.q.slice(0, -1);
+  else if (c === "SPC") { if (SR.q && !SR.q.endsWith(" ")) SR.q += " "; }
+  else if (c === "DONE") return runSearch();
+  else if (SR.q.length < 24) SR.q += c;
+  renderSearch();
+}
+function runSearch() {
+  const q = SR.q.trim(); if (!q || SR.busy) return;
+  SR.busy = true; renderSearch();
+  itunes("search", { term: q, entity: "song", limit: 50 }).then(d => { LIB.search = d.results.filter(r => r.previewUrl).map(fromItunes); })
+    .catch(() => { LIB.search = []; toast("Search failed (offline?)"); })
+    .finally(() => { SR.busy = false; if (cur().key === "search") { stack.pop(); push("results"); } });
+}
+
+/* ---------------- Brick (hidden: hold center on About) ---------------- */
+const BR = { W: 148, H: 101, cols: 12, rows: 4, gap: 2, side: 3, top: 12, bh: 4, pw: 30, ph: 3, py: 93, r: 1.5, sp: Math.hypot(1.7, 1.7) };
+let brick = null, brickRAF = 0;
+function brickNew() {
+  const bw = (BR.W - BR.side * 2 - (BR.cols - 1) * BR.gap) / BR.cols, bricks = [];
+  for (let r = 0; r < BR.rows; r++) for (let c = 0; c < BR.cols; c++) bricks.push({ x: BR.side + c * (bw + BR.gap), y: BR.top + r * (BR.bh + BR.gap), w: bw, h: BR.bh, dead: false });
+  return bricks;
+}
+function brickReset(full) {
+  if (full || !brick) brick = { px: (BR.W - BR.pw) / 2, bricks: brickNew(), score: 0, balls: 3, level: 1, over: false };
+  brick.ball = { x: brick.px + BR.pw / 2, y: BR.py - 3, dx: 1.7, dy: -1.7 }; brick.live = false;
+}
+function renderBrick() {
+  setTitle("Brick");
+  view.innerHTML = '<canvas class="brick" id="bc" width="' + BR.W + '" height="' + BR.H + '"></canvas><div class="bmsg" id="bmsg"></div><div class="bstat"><span id="bsc"></span><span id="bba"></span></div>';
+  if (!brick) brickReset(true);
+  cancelAnimationFrame(brickRAF); let last = performance.now(), acc = 0;
+  const loop = now => { acc += Math.min(100, now - last); last = now; while (acc >= 16.67) { brickTick(); acc -= 16.67; } brickDraw(); brickRAF = requestAnimationFrame(loop); };
+  brickRAF = requestAnimationFrame(loop); refreshChrome();
+}
+function exitBrick() { if (cur().key !== "brick") cancelAnimationFrame(brickRAF); }
+function brickTick() {
+  const g = brick, b = g.ball; if (!g || g.over) return;
+  if (!g.live) { b.x = g.px + BR.pw / 2; b.y = BR.py - 3; return; }
+  b.x += b.dx * (1 + 0.1 * (g.level - 1)); b.y += b.dy * (1 + 0.1 * (g.level - 1));
+  if ((b.x <= BR.r && b.dx < 0) || (b.x >= BR.W - BR.r && b.dx > 0)) b.dx = -b.dx;
+  if (b.y <= BR.r && b.dy < 0) b.dy = -b.dy;
+  if (b.dy > 0 && b.y + BR.r >= BR.py && b.y < BR.py + BR.ph && b.x + BR.r >= g.px && b.x - BR.r <= g.px + BR.pw) {
+    const off = clamp((b.x - (g.px + BR.pw / 2)) / (BR.pw / 2), -1, 1), ang = off * 1.05, sp = BR.sp;
+    b.dx = Math.sin(ang) * sp; b.dy = -Math.cos(ang) * sp; click();
+  }
+  for (const k of g.bricks) {
+    if (k.dead || b.x + BR.r < k.x || b.x - BR.r > k.x + k.w || b.y + BR.r < k.y || b.y - BR.r > k.y + k.h) continue;
+    k.dead = true; g.score++; click();
+    const ox = Math.min(b.x + BR.r - k.x, k.x + k.w - (b.x - BR.r)), oy = Math.min(b.y + BR.r - k.y, k.y + k.h - (b.y - BR.r));
+    if (ox < oy) b.dx = -b.dx; else b.dy = -b.dy; break;
+  }
+  if (g.bricks.every(k => k.dead)) { g.level++; g.bricks = brickNew(); brickReset(false); }
+  if (b.y > BR.H) { g.balls--; if (g.balls <= 0) { g.over = true; g.live = false; } else brickReset(false); }
+}
+function brickDraw() {
+  const cv = $("bc"); if (!cv) return; const x = cv.getContext("2d"), g = brick;
+  /* LCD ghosting: fade previous frame instead of clearing */
+  x.globalCompositeOperation = "destination-out"; x.fillStyle = "rgba(0,0,0,0.45)"; x.fillRect(0, 0, BR.W, BR.H); x.globalCompositeOperation = "source-over";
+  x.fillStyle = "#22262b";
+  g.bricks.forEach(k => { if (!k.dead) x.fillRect(Math.round(k.x), k.y, Math.round(k.w), k.h); });
+  x.fillRect(Math.round(g.px), BR.py, BR.pw, BR.ph);
+  if (!g.over) x.fillRect(Math.round(g.ball.x - 1.5), Math.round(g.ball.y - 1.5), 3, 3);
+  $("bsc").textContent = "Score " + g.score; $("bba").textContent = "Balls " + g.balls;
+  $("bmsg").innerHTML = g.over ? "GAME OVER<br>Press Center" : !g.live ? "Press Center to Launch Ball" : "";
+}
+function brickMove(deg) { if (brick && !brick.over) brick.px = clamp(brick.px + deg / 360 * 60, 0, BR.W - BR.pw); }
+function brickCenter() { if (brick.over) brickReset(true); else brick.live = true; }
+
+/* ---------------- Now Playing modes ---------------- */
+let npMode = "normal", npTimer = 0, seekPreview = null;
+function npEnter(mode, ms) {
+  npMode = mode; clearTimeout(npTimer);
+  npTimer = setTimeout(() => { if (npMode === "seek" && seekPreview != null) commitSeek(); npMode = "normal"; seekPreview = null; updateNP(); }, ms);
+  updateNP();
+}
+function commitSeek() { if (seekPreview != null) { try { A().a.currentTime = seekPreview; } catch (e) {} } seekPreview = null; }
+
+/* ---------------- input handling ---------------- */
+let idleT = 0;
+function bumpIdle() {
+  clearTimeout(idleT);
+  idleT = setTimeout(() => {
+    const k = cur().key;
+    if (P.playing && curSong() && !["nowplaying", "brick", "search", "boot"].includes(k)) push("nowplaying");
+  }, T.idleToNowPlayingMs);
+}
+function activity() { wake(); bumpIdle(); }
+const acc = { speed: 0, dir: 0, last: 0, fastSince: null };
+function tierFor(degPerSec, dir, tiers) {
+  const now = performance.now(), gap = acc.last && now - acc.last > T.accel.gapMs; acc.last = now;
+  const sp = Math.min(degPerSec, T.accel.maxSpeed);
+  if (dir !== acc.dir || gap) { acc.speed = sp; acc.dir = dir; acc.fastSince = null; }
+  else acc.speed += T.accel.alpha * (sp - acc.speed);
+  if (acc.speed <= T.accel.minSpeed) { acc.fastSince = null; return tiers[0]; }
+  if (acc.fastSince == null) acc.fastSince = now;
+  return tiers[Math.min(tiers.length - 1, Math.floor((now - acc.fastSince) / T.accel.tierMs))];
+}
+/* rotation in degrees (signed) from any source; drives whichever control is active */
+let rot = 0, volClick = 0;
+function onRotate(deg, degPerSec) {
+  activity();
+  const st = cur(), dir = deg > 0 ? 1 : -1;
+  if (st.key === "boot") return;
+  if (st.key === "brick") { brickMove(deg); return; }
+  if (st.key === "nowplaying" && curSong() && npMode !== "seek") {
+    if (npMode !== "volume") { rot = 0; volClick = 0; }
+    npEnter("volume", T.volOverlayMs);
+    rot += deg; volClick += deg;
+    const units = Math.trunc(rot / T.volUnitDeg); rot -= units * T.volUnitDeg;
+    if (units) { const nv = clamp(S.volume + units, 0, 100); const moved = nv !== S.volume; S.volume = nv; applyVolume(); save(); updateNP();
+      const clicks = Math.trunc(volClick / T.volClickDeg); if (clicks) { volClick -= clicks * T.volClickDeg; if (moved) click(Math.abs(clicks)); } }
+    return;
+  }
+  const stepDeg = st.key === "nowplaying" ? T.seekStepDeg : T.listStepDeg;
+  if (Math.sign(rot) !== dir) rot = 0;
+  rot += deg;
+  let n = Math.trunc(rot / stepDeg); if (!n) return; rot -= n * stepDeg;
+  if (st.key === "nowplaying") {
+    const a = A().a, d = isFinite(a.duration) ? a.duration : 30, mult = tierFor(degPerSec, dir, T.accel.seek);
+    seekPreview = clamp((seekPreview != null ? seekPreview : a.currentTime) + n * mult * T.seekStepSec, 0, Math.max(0, d - 0.25));
+    npEnter("seek", T.seekModeMs); return;
+  }
+  if (st.key === "search") { const ni = clamp(SR.i + n, 0, CHARS.length - 1); if (ni !== SR.i) { SR.i = ni; click(Math.abs(n)); renderSearch(); } return; }
+  const items = itemsOf(st); if (!items.length) return;
+  const mult = tierFor(degPerSec, dir, T.accel.list);
+  const firstSel = items.findIndex(it => !(it.info && !it.value));
+  const ns = clamp(st.sel + n * mult, Math.max(0, firstSel), items.length - 1);
+  if (ns !== st.sel) { st.sel = ns; click(Math.min(Math.abs(n), 3)); render(); }
+}
+function onStep(dir) { onRotate(dir * (cur().key === "nowplaying" && npMode !== "seek" ? T.volUnitDeg * 2 : cur().key === "brick" ? 24 : T.listStepDeg), 0); }
+function onSelect() {
+  activity(); ensureAudio();
+  const st = cur();
+  if (st.key === "boot") { if (!LIB.ready) return; stack = [{ key: "main", sel: 0, top: 0 }]; click(); render(); return; }
+  if (st.key === "brick") { brickCenter(); return; }
+  if (st.key === "nowplaying") {
+    if (!curSong()) return; click();
+    if (npMode === "seek") { commitSeek(); npMode = "normal"; clearTimeout(npTimer); updateNP(); }
+    else { seekPreview = A().a.currentTime; npEnter("seek", T.seekModeMs); }
+    return;
+  }
+  if (st.key === "search") { click(); searchSelect(); return; }
+  const it = itemsOf(st)[st.sel]; if (!it || (it.info && !it.action)) return;
+  click();
+  if (it.go) push(it.go, it.ctx, it.title); else if (it.action) it.action();
+}
+function onMenu() {
+  activity(); ensureAudio(); click();
+  if (cur().key === "nowplaying" && npMode === "seek") commitSeek();
+  clearTimeout(npTimer); back();
+}
+function onPlay() { activity(); ensureAudio(); if (cur().key === "boot") { onSelect(); return; } click(); togglePlay(); if (cur().key !== "nowplaying" && curSong() && P.list.length && !P.playing && false) push("nowplaying"); }
+function onNext() { activity(); ensureAudio(); if (cur().key === "boot" || cur().key === "brick") return; click(); next(); if (cur().key === "nowplaying") renderNP(); }
+function onPrev() { activity(); ensureAudio(); if (cur().key === "boot" || cur().key === "brick") return; click(); prev(); if (cur().key === "nowplaying") renderNP(); }
+function holdSeek(dir, n) { const a = A().a; if (!curSong()) return; const s = T.holdSeek[Math.min(n, T.holdSeek.length - 1)]; a.currentTime = clamp(a.currentTime + dir * s, 0, (a.duration || 30) - 0.3); activity(); if (cur().key === "nowplaying") updateNP(); }
+function centerHold() { if (cur().key === "about") { click(); push("brick"); brickReset(true); render(); } }
+
+/* ---------------- click wheel pointer tracking ---------------- */
+const wheel = $("wheel"), inner = $("inner"), segs = { menu: $("seg-menu"), prev: $("seg-prev"), next: $("seg-next"), play: $("seg-play"), center: $("center") };
+const W = { id: null, last: null, lastT: 0, dir: 0, flip: 0, zone: null, moved: 0, dragging: false, spin: 0, holdT: 0, holdIv: 0, held: false, holdN: 0 };
+const CENTER_R = 0.29, INNER_R = 0.72;
+function geo(e) { const r = wheel.getBoundingClientRect(), R = Math.min(r.width, r.height) / 2; const x = e.clientX - (r.left + r.width / 2), y = e.clientY - (r.top + r.height / 2); return { x, y, R, d: Math.hypot(x, y) / R }; }
+function zoneOf(g) {
+  if (g.d > 1.02) return null; if (g.d < CENTER_R) return "center"; if (g.d < INNER_R) return "wheel";
+  const a = Math.atan2(g.y, g.x) * 180 / Math.PI;
+  return a > -135 && a <= -45 ? "menu" : a > -45 && a <= 45 ? "next" : a > 45 && a <= 135 ? "play" : "prev";
+}
+const angDiff = (a, b) => ((b - a) % 360 + 540) % 360 - 180;
+/* closest approach of a move segment to the centre (squared): rejects moves that cut across the hub */
+function segDist2(p, q) { const dx = q.x - p.x, dy = q.y - p.y, l = dx * dx + dy * dy, t = l ? clamp(-(p.x * dx + p.y * dy) / l, 0, 1) : 0, x = p.x + t * dx, y = p.y + t * dy; return x * x + y * y; }
+function setDown(z, on) { if (z && segs[z]) segs[z].classList.toggle("down", on); }
+function stopHold() { clearTimeout(W.holdT); clearInterval(W.holdIv); W.holdT = W.holdIv = 0; }
+wheel.addEventListener("pointerdown", e => {
+  if (W.id !== null || (e.pointerType === "mouse" && e.button !== 0)) return;
+  const g = geo(e), z = zoneOf(g); if (!z) return;
+  e.preventDefault(); ensureAudio(); activity();
+  Object.assign(W, { id: e.pointerId, last: g, lastT: e.timeStamp, dir: 0, flip: 0, zone: z, moved: 0, dragging: false, held: false, holdN: 0 });
+  try { wheel.setPointerCapture(e.pointerId); } catch (_) {}
+  setDown(z, true); wheel.classList.add("grab");
+  stopHold();
+  if (z === "next" || z === "prev") W.holdT = setTimeout(() => { W.held = true; const d = z === "next" ? 1 : -1; holdSeek(d, W.holdN++); W.holdIv = setInterval(() => holdSeek(d, W.holdN++), T.holdRepeatMs); }, T.holdMs);
+  if (z === "center") W.holdT = setTimeout(() => { if (cur().key === "about") { W.held = true; centerHold(); } }, T.aboutHoldMs);
+});
+wheel.addEventListener("pointermove", e => {
+  if (e.pointerId !== W.id) return; e.preventDefault();
+  const g = geo(e), p = W.last, dt = e.timeStamp - W.lastT;
+  if (W.zone === "center" && !W.dragging) { if (g.d < CENTER_R) return; }
+  const min = g.R * T.minChord;
+  if (Math.hypot(g.x - p.x, g.y - p.y) < min) return;                 /* too small: wait for more movement */
+  W.last = g; W.lastT = e.timeStamp;
+  if (segDist2(p, g) < min * min) return;                              /* cut through the dead zone at the hub */
+  const d = angDiff(Math.atan2(p.y, p.x) * 180 / Math.PI, Math.atan2(g.y, g.x) * 180 / Math.PI);
+  if (!d) return;
+  const s = Math.sign(d), ad = Math.abs(d);
+  if (W.dir && s !== W.dir) { W.flip += ad; if (W.flip < T.flipDeg) return; }  /* direction-flip smoothing */
+  W.dir = s; W.flip = 0;
+  if (!W.dragging) { W.dragging = true; setDown(W.zone, false); stopHold(); }
+  W.spin += d; inner.style.setProperty("--a", W.spin + "deg");
+  onRotate(d, dt > 0 ? ad / dt * 1000 : 0);
+});
+function endPointer(e, cancelled) {
+  if (e.pointerId !== W.id) return;
+  const z = W.zone, wasDrag = W.dragging, wasHeld = W.held;
+  W.id = null; W.zone = null; stopHold(); setDown(z, false); wheel.classList.remove("grab");
+  if (cancelled || wasDrag || wasHeld) return;
+  if (zoneOf(geo(e)) !== z) return;
+  ({ center: onSelect, menu: onMenu, play: onPlay, next: onNext, prev: onPrev })[z]?.();
+}
+wheel.addEventListener("pointerup", e => endPointer(e, false));
+wheel.addEventListener("pointercancel", e => endPointer(e, true));
+wheel.addEventListener("lostpointercapture", e => { if (e.pointerId === W.id) endPointer(e, true); });
+wheel.addEventListener("contextmenu", e => e.preventDefault());
+/* mouse wheel / trackpad: 1 detent per ~40px */
+let wAcc = 0, wLast = 0;
+document.addEventListener("wheel", e => {
+  if (!$("ipod").contains(e.target)) return;
+  e.preventDefault(); ensureAudio();
+  wAcc += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+  while (Math.abs(wAcc) >= 40) { const dir = Math.sign(wAcc); wAcc -= dir * 40; const now = performance.now(), dps = wLast ? 15 / Math.max(1, now - wLast) * 1000 : 0; wLast = now;
+    W.spin += dir * 15; inner.style.setProperty("--a", W.spin + "deg");
+    if (cur().key === "nowplaying" && npMode !== "seek") onRotate(dir * T.volUnitDeg * 2, 0); else if (cur().key === "brick") onRotate(dir * 24, 0); else onRotate(dir * T.listStepDeg, dps); }
+}, { passive: false });
+/* keyboard */
+const keyHold = {};
+document.addEventListener("keydown", e => {
+  const k = e.key, st = cur().key;
+  if (st === "search" && !e.metaKey && !e.ctrlKey) {
+    if (/^[a-z0-9]$/i.test(k)) { SR.q = (SR.q + k.toUpperCase()).slice(0, 24); renderSearch(); e.preventDefault(); return; }
+    if (k === "Backspace") { SR.q = SR.q.slice(0, -1); renderSearch(); e.preventDefault(); return; }
+  }
+  const map = { ArrowDown: () => onStep(1), ArrowUp: () => onStep(-1), ArrowRight: () => st === "brick" ? onRotate(24, 0) : (e.repeat ? null : onNext()), ArrowLeft: () => st === "brick" ? onRotate(-24, 0) : (e.repeat ? null : onPrev()),
+    Enter: () => e.repeat ? null : onSelect(), " ": () => e.repeat ? null : onPlay(), Escape: onMenu, Backspace: onMenu, m: onMenu, M: onMenu };
+  const f = map[k]; if (!f) return; e.preventDefault();
+  if (k === "ArrowDown" || k === "ArrowUp") { W.spin += (k === "ArrowDown" ? 15 : -15); inner.style.setProperty("--a", W.spin + "deg"); }
+  if ((k === "ArrowRight" || k === "ArrowLeft") && st !== "brick" && e.repeat) { keyHold[k] = (keyHold[k] || 0) + 1; if (keyHold[k] % 4 === 0) holdSeek(k === "ArrowRight" ? 1 : -1, keyHold[k] / 4); return; }
+  if (k === "Enter" && st === "about" && !e.repeat) keyHold.enter = setTimeout(centerHold, T.aboutHoldMs);
+  f();
+});
+document.addEventListener("keyup", e => { if (e.key === "Enter") clearTimeout(keyHold.enter); keyHold[e.key] = 0; });
+
+/* ---------------- mini player ---------------- */
+$("mplay").onclick = () => { ensureAudio(); activity(); if (cur().key === "boot") { if (!LIB.ready) return; stack = [{ key: "main", sel: 0, top: 0 }]; render(); } togglePlay(); };
+$("mnext").onclick = () => { ensureAudio(); activity(); next(); if (cur().key === "nowplaying") renderNP(); };
+let miniSong = null;
+function updateMini() {
+  const s = curSong();
+  $("mplayico").innerHTML = P.playing ? '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>' : '<path d="M7 4.5v15l12.5-7.5z"/>';
+  $("mplay").setAttribute("aria-label", P.playing ? "Pause" : "Play"); $("mnext").disabled = !s;
+  if (s === miniSong) return; miniSong = s;
+  $("mt").textContent = s ? s.name + (s.explicit ? " \u{1F174}" : "") : "Not Playing";
+  $("ma").textContent = s ? s.artist : "Press the center button to start";
+  const art = $("mart");
+  if (s && s.art) { art.style.backgroundImage = "url('" + s.art.replace(/\/\d+x\d+bb\./, "/120x120bb.") + "')"; art.textContent = ""; }
+  else { art.style.backgroundImage = ""; art.innerHTML = "&#9835;"; }
+  if (s && "mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: s.name, artist: s.artist, album: s.album,
+    artwork: s.art ? [{ src: s.art.replace(/\/\d+x\d+bb\./, "/512x512bb."), sizes: "512x512" }] : [] });
+}
+function updateMiniProgress() { const a = A().a, d = a.duration; $("mprog").style.width = (isFinite(d) && d ? 100 * a.currentTime / d : 0) + "%"; }
+
+/* ---------------- backlight ---------------- */
+let blT = 0;
+function wake() {
+  const lcd = $("lcd"); clearTimeout(blT);
+  if (S.backlight === "off") { lcd.classList.remove("lit"); return; }
+  lcd.classList.add("lit");
+  if (S.backlight !== "always") blT = setTimeout(() => lcd.classList.remove("lit"), Number(S.backlight) * 1000);
+}
+if (darkPref && darkPref.addEventListener) darkPref.addEventListener("change", () => { if (!localStorage.getItem(SKEY)) { S.backlight = DEFAULTS().backlight; wake(); } });
+
+/* ---------------- optional subtle tilt (Settings > 3D Tilt, off by default) ---------------- */
+const tilt = $("tilt"); let tdrag = null;
+function applySettings() { applyVolume(); if (S.tilt !== "on") tilt.style.transform = ""; wake(); }
+document.addEventListener("pointerdown", e => { if (S.tilt !== "on" || wheel.contains(e.target) || $("mini").contains(e.target)) return; tdrag = { x: e.clientX, y: e.clientY }; tilt.classList.add("dragging"); });
+document.addEventListener("pointermove", e => { if (!tdrag) return; tilt.style.transform = "rotateX(" + clamp(-(e.clientY - tdrag.y) / 14, -10, 10) + "deg) rotateY(" + clamp((e.clientX - tdrag.x) / 12, -14, 14) + "deg)"; });
+document.addEventListener("pointerup", () => { if (!tdrag) return; tdrag = null; tilt.classList.remove("dragging"); tilt.style.transform = ""; });
+
+/* ---------------- layout ---------------- */
+function fit() {
+  const vw = window.innerWidth, vh = window.innerHeight, brand = $("brand").textContent ? 20 : 0;
+  const s = Math.min(1, (vw - 16) / 400, (vh - 84 - 24 - brand - (vh > 820 ? 60 : 0)) / 672);
+  const sc = Math.max(0.4, s);
+  $("scaler").style.setProperty("--s", sc); $("scaler").style.height = (672 * sc) + "px";
+}
+window.addEventListener("resize", fit);
+let toastT = 0;
+function toast(m) { const t = $("toast"); t.textContent = m; t.style.opacity = 1; clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 2500); }
+
+/* ---------------- boot ---------------- */
+fit(); applySettings(); render(); updateMini();
+fetch(DATA_URL, { credentials: "omit" }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(d => { ingest(d); fit(); if (cur().key === "boot") render(); })
+  .catch(err => { LIB.failed = true; console.error("songs.json failed", err); render(); });
+window.__pod = { T, seek: t => { A().a.currentTime = t; }, dur: () => A().a.duration, onRotate, onSelect, onMenu, onPlay, onNext, onPrev,
+  state: () => ({ view: cur().key, stack: stack.map(s => s.key), sel: cur().sel, title: $("title").textContent, song: curSong() && curSong().name, playing: P.playing, vol: S.volume, np: npMode,
+    songs: LIB.songs.length, artists: LIB.artists.length, playlists: LIB.playlists.map(p => p.name), webAudio, actx: actx && actx.state, t: A().a.currentTime, lit: $("lcd").classList.contains("lit"), ch: curCh }) };
+</script>
+</body>
+</html>
