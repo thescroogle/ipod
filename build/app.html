@@ -107,7 +107,7 @@ function cuePreload() {
   const list = ctx && ctx.songs.includes(s) ? ctx.songs : [s];
   P.list = list.slice(); P.source = ctx ? kind + ":" + id : null; P.order = P.list.map((_, i) => i); P.pos = list.indexOf(s);
   if (S.shuffle === "songs") { shuffleArr(P.order); const k = P.order.indexOf(P.pos); [P.order[0], P.order[k]] = [P.order[k], P.order[0]]; P.pos = 0; }
-  const c = A(); c.song = s; c.a.preload = "metadata"; c.a.src = srcOf(s); P.ever = true; P.cued = true;
+  const c = A(); c.song = s; c.a.preload = "auto"; c.a.src = srcOf(s); c.a.load(); P.ever = true; P.cued = true;
   updateMini(); refreshChrome();
 }
 function fromItunes(r) {
@@ -139,6 +139,7 @@ const CH = [mkChannel(), mkChannel()];
 let curCh = 0;
 function ensureAudio() {
   if (!actx) {
+    try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
     try {
       actx = new (window.AudioContext || window.webkitAudioContext)();
       master = actx.createGain(); master.connect(actx.destination);
@@ -149,7 +150,11 @@ function ensureAudio() {
   }
   if (actx && actx.state !== "running") actx.resume().catch(() => {});
   /* iOS: each media element must be started once inside a user gesture */
-  CH.forEach(c => { if (!c.unlocked && !c.a.src) { c.a.src = SILENT; const p = c.a.play(); if (p) p.then(() => { c.a.pause(); }).catch(() => {}); } c.unlocked = true; });
+  /* prime the idle channel so a later crossfade may start it without a gesture; retried until it succeeds */
+  CH.forEach(c => { if (c.unlocked || c.priming) return;
+    if (!c.a.getAttribute("src") || c.a.src === SILENT) { c.priming = true; c.a.src = SILENT; c.a.muted = true; const p = c.a.play();
+      if (p) p.then(() => { c.unlocked = true; if (c.a.src === SILENT) c.a.pause(); c.a.muted = false; c.priming = false; }).catch(() => { c.a.muted = false; c.priming = false; }); }
+    else if (!c.a.paused) c.unlocked = true; });
 }
 function applyVolume() {
   const v = S.volume / 100;
@@ -213,8 +218,21 @@ function startCurrent(autoplay, crossfade) {
   P.fading = false; P.ever = true; updateMini(); bumpIdle();
   if (cur().key === "nowplaying") renderNP();
 }
-function play() { ensureAudio(); const c = A(); if (!c.song) return; P.cued = false; c.a.preload = "auto"; cutIn(c); c.a.play().catch(() => {}); }
-function pause() { CH.forEach(c => c.a.pause()); }
+// Some engines (WebKit/GStreamer) report the full-track length from the preview's
+// header; Apple previews are 30 s, so cap preview durations to keep fades and progress right.
+function durOf(c) { const d = c.a.duration; if (!isFinite(d) || d <= 0) return NaN; return c.song && !c.song.src ? Math.min(d, 30) : d; }
+let wantPlay = false;
+function play() {
+  ensureAudio(); const c = A(); if (!c.song) return;
+  P.cued = false; c.a.muted = false; cutIn(c); wantPlay = true;
+  const p = c.a.play();
+  if (p) p.then(() => { wantPlay = false; c.unlocked = true; }).catch(err => { if (err && err.name === "NotAllowedError") toast("Tap \u25B6\u2759\u2759 to play"); });
+}
+/* Belt and braces for iOS: if play() was refused inside pointerup, retry inside the touchend/click of the same tap. */
+function gestureRetry() { ensureAudio(); if (wantPlay && A().song && A().a.paused) { cutIn(A()); A().a.play().then(() => { wantPlay = false; }).catch(() => {}); } }
+document.addEventListener("touchend", gestureRetry, { capture: true, passive: true });
+document.addEventListener("click", gestureRetry, true);
+function pause() { wantPlay = false; CH.forEach(c => c.a.pause()); }
 function togglePlay() {
   if (!curSong()) { if (LIB.songs.length) { setQueue(LIB.songs, 0, "songs"); } return; }
   A().a.paused ? play() : pause();
@@ -239,7 +257,7 @@ function wire(c) {
   c.a.addEventListener("pause", () => { if (c === A()) { P.playing = false; refreshChrome(); } });
   c.a.addEventListener("timeupdate", () => {
     if (c !== A() || !c.song) return;
-    const d = c.a.duration, t = c.a.currentTime;
+    const d = durOf(c), t = c.a.currentTime;
     if (!P.fading && webAudio && isFinite(d) && d > T.fadeSec + 1 && t >= d - T.fadeSec) {
       P.fading = true;
       if (!advance(true, true)) setGain(c, fadeOut, T.fadeSec);
@@ -372,7 +390,7 @@ function updateNP() {
   const s = curSong(), b = $("npbar"); if (!s || !b) return;
   const a = A().a;
   $("npidx").textContent = (P.pos + 1) + " of " + P.order.length;
-  const d = isFinite(a.duration) && a.duration > 0 ? a.duration : (s.src ? (s.dur || 0) / 1000 : 30) || 30;
+  const d = isFinite(durOf(A())) ? durOf(A()) : (s.src ? (s.dur || 0) / 1000 : 30) || 30;
   const t = npMode === "seek" && seekPreview != null ? seekPreview : (a.currentTime || 0);
   b.style.width = (100 * t / d) + "%"; $("npdia").style.left = (100 * t / d) + "%";
   $("npel").textContent = fmt(t); $("nprem").textContent = "-" + fmt(d - t);
@@ -513,7 +531,7 @@ function onRotate(deg, degPerSec) {
   rot += deg;
   let n = Math.trunc(rot / stepDeg); if (!n) return; rot -= n * stepDeg;
   if (st.key === "nowplaying") {
-    const a = A().a, d = isFinite(a.duration) ? a.duration : 30, mult = tierFor(degPerSec, dir, T.accel.seek);
+    const a = A().a, d = isFinite(durOf(A())) ? durOf(A()) : 30, mult = tierFor(degPerSec, dir, T.accel.seek);
     seekPreview = clamp((seekPreview != null ? seekPreview : a.currentTime) + n * mult * T.seekStepSec, 0, Math.max(0, d - 0.25));
     npEnter("seek", T.seekModeMs); return;
   }
@@ -528,11 +546,17 @@ function onStep(dir) { onRotate(dir * (cur().key === "nowplaying" && npMode !== 
 function onSelect() {
   activity(); ensureAudio();
   const st = cur();
-  if (st.key === "boot") { if (!LIB.ready) return; stack = [{ key: "main", sel: P.cued && curSong() ? 4 : 0, top: 0 }]; click(); render(); return; }
+  if (st.key === "boot") {
+    if (!LIB.ready) return;
+    stack = [{ key: "main", sel: curSong() ? 4 : 0, top: 0 }];
+    if (curSong()) { play(); click(); push("nowplaying"); } else { click(); render(); }
+    return;
+  }
   if (st.key === "brick") { brickCenter(); return; }
   if (st.key === "nowplaying") {
     if (!curSong()) return; click();
     if (npMode === "seek") { commitSeek(); npMode = "normal"; clearTimeout(npTimer); updateNP(); }
+    else if (A().a.paused) { play(); }
     else { seekPreview = A().a.currentTime; npEnter("seek", T.seekModeMs); }
     return;
   }
@@ -546,10 +570,10 @@ function onMenu() {
   if (cur().key === "nowplaying" && npMode === "seek") commitSeek();
   clearTimeout(npTimer); back();
 }
-function onPlay() { activity(); ensureAudio(); if (cur().key === "boot") { if (!LIB.ready) return; stack = [{ key: "main", sel: 0, top: 0 }]; click(); togglePlay(); push("nowplaying"); return; } click(); togglePlay(); if (cur().key !== "nowplaying" && curSong() && P.list.length && !P.playing && false) push("nowplaying"); }
+function onPlay() { activity(); ensureAudio(); if (cur().key === "boot") { if (!LIB.ready) return; stack = [{ key: "main", sel: curSong() ? 4 : 0, top: 0 }]; togglePlay(); click(); push("nowplaying"); return; } click(); togglePlay(); if (cur().key !== "nowplaying" && curSong() && P.list.length && !P.playing && false) push("nowplaying"); }
 function onNext() { activity(); ensureAudio(); if (cur().key === "boot" || cur().key === "brick") return; click(); next(); if (cur().key === "nowplaying") renderNP(); }
 function onPrev() { activity(); ensureAudio(); if (cur().key === "boot" || cur().key === "brick") return; click(); prev(); if (cur().key === "nowplaying") renderNP(); }
-function holdSeek(dir, n) { const a = A().a; if (!curSong()) return; const s = T.holdSeek[Math.min(n, T.holdSeek.length - 1)]; a.currentTime = clamp(a.currentTime + dir * s, 0, (a.duration || 30) - 0.3); activity(); if (cur().key === "nowplaying") updateNP(); }
+function holdSeek(dir, n) { const a = A().a; if (!curSong()) return; const s = T.holdSeek[Math.min(n, T.holdSeek.length - 1)]; a.currentTime = clamp(a.currentTime + dir * s, 0, (durOf(A()) || 30) - 0.3); activity(); if (cur().key === "nowplaying") updateNP(); }
 function centerHold() { if (cur().key === "about") { click(); push("brick"); brickReset(true); render(); } }
 
 /* ---------------- click wheel pointer tracking ---------------- */
@@ -570,7 +594,7 @@ function stopHold() { clearTimeout(W.holdT); clearInterval(W.holdIv); W.holdT = 
 wheel.addEventListener("pointerdown", e => {
   if (W.id !== null || (e.pointerType === "mouse" && e.button !== 0)) return;
   const g = geo(e), z = zoneOf(g); if (!z) return;
-  e.preventDefault(); ensureAudio(); activity();
+  e.preventDefault(); activity();   /* no audio work here: touchstart is not a media gesture on iOS */
   Object.assign(W, { id: e.pointerId, last: g, lastT: e.timeStamp, dir: 0, flip: 0, zone: z, moved: 0, dragging: false, held: false, holdN: 0 });
   try { wheel.setPointerCapture(e.pointerId); } catch (_) {}
   setDown(z, true); wheel.classList.add("grab");
@@ -652,7 +676,7 @@ function updateMini() {
   if (s && "mediaSession" in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: s.name, artist: s.artist, album: s.album,
     artwork: s.art ? [{ src: s.art.replace(/\/\d+x\d+bb\./, "/512x512bb."), sizes: "512x512" }] : [] });
 }
-function updateMiniProgress() { const a = A().a, d = a.duration; $("mprog").style.width = (isFinite(d) && d ? 100 * a.currentTime / d : 0) + "%"; }
+function updateMiniProgress() { const a = A().a, d = durOf(A()); $("mprog").style.width = (isFinite(d) && d ? 100 * a.currentTime / d : 0) + "%"; }
 
 /* ---------------- backlight ---------------- */
 let blT = 0;
@@ -687,8 +711,8 @@ fit(); applySettings(); render(); updateMini();
 fetch(DATA_URL, { credentials: "omit" }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
   .then(d => { ingest(d); cuePreload(); fit(); if (cur().key === "boot") render(); })
   .catch(err => { LIB.failed = true; console.error("songs.json failed", err); render(); });
-window.__pod = { T, seek: t => { A().a.currentTime = t; }, dur: () => A().a.duration, onRotate, onSelect, onMenu, onPlay, onNext, onPrev,
-  state: () => ({ cued: !!P.cued, mini: $("mt").textContent, art: $("mart").style.backgroundImage.slice(0, 60), main: SCREENS.main.items().map(i => i.label), view: cur().key, stack: stack.map(s => s.key), sel: cur().sel, title: $("title").textContent, song: curSong() && curSong().name, playing: P.playing, vol: S.volume, np: npMode,
+window.__pod = { T, seek: t => { A().a.currentTime = t; }, dur: () => durOf(A()), onRotate, onSelect, onMenu, onPlay, onNext, onPrev,
+  state: () => ({ want: wantPlay, paused: A().a.paused, ready: A().a.readyState, cued: !!P.cued, mini: $("mt").textContent, art: $("mart").style.backgroundImage.slice(0, 60), main: SCREENS.main.items().map(i => i.label), view: cur().key, stack: stack.map(s => s.key), sel: cur().sel, title: $("title").textContent, song: curSong() && curSong().name, playing: P.playing, vol: S.volume, np: npMode,
     songs: LIB.songs.length, artists: LIB.artists.length, playlists: LIB.playlists.map(p => p.name), webAudio, actx: actx && actx.state, t: A().a.currentTime, lit: $("lcd").classList.contains("lit"), ch: curCh }) };
 </script>
 </body>
